@@ -97,6 +97,7 @@ def create_annotation_instruction(ann_type, page, coords, text=None, color=None)
 def convert_pdf_page_to_image(pdf_path: str, page_number: int, dpi: int = 300) -> str:
     """
     Converts a specific page of a PDF file into a high-resolution PNG image.
+    Returns a JSON string with image_path and dimensions for reliable downstream mapping.
     """
     try:
         if not os.path.exists(pdf_path):
@@ -112,14 +113,38 @@ def convert_pdf_page_to_image(pdf_path: str, page_number: int, dpi: int = 300) -
         base_name = os.path.splitext(os.path.basename(pdf_path))[0]
         image_path = f"{base_name}_page_{page_number}.png"
         
-        # Render page to an image
-        pixmap = page.get_pixmap(dpi=dpi)
+        # Render page to an image with an explicit matrix to avoid implicit rotations surprises
+        zoom = dpi / 72.0
+        mat = fitz.Matrix(zoom, zoom)
+        # Keep render rotation at 0 so image pixels map 1:zoom with page points
+        render_rotation = 0
+        pixmap = page.get_pixmap(matrix=mat, rotation=render_rotation)
         pixmap.save(image_path)
+        
+        # Collect mapping info
+        image_width = pixmap.width
+        image_height = pixmap.height
+        page_width_pt = float(page.rect.width)
+        page_height_pt = float(page.rect.height)
+        scale_x = page_width_pt / float(image_width)
+        scale_y = page_height_pt / float(image_height)
         
         doc.close()
         
-        print(f"DEBUG: Image saved to {image_path}")
-        return image_path
+        print(f"DEBUG: Image saved to {image_path} ({image_width}x{image_height}), page size {page_width_pt}x{page_height_pt} pt")
+        return json.dumps({
+            "image_path": image_path,
+            "page_number": page_number,
+            "dpi": dpi,
+            "zoom": zoom,
+            "rotation": render_rotation,
+            "image_width": image_width,
+            "image_height": image_height,
+            "page_width_pt": page_width_pt,
+            "page_height_pt": page_height_pt,
+            "scale_x": scale_x,
+            "scale_y": scale_y
+        })
         
     except Exception as e:
         return f"Error converting PDF page to image: {str(e)}"
@@ -129,14 +154,24 @@ def get_object_dimensions(image_path: str) -> str:
     """
     Identifies objects in an image and returns a list of detected objects
     with their class names and bounding box dimensions.
+    Accepts either an image path or a JSON string containing `image_path`.
     """
     try:
+        # Accept JSON or plain path
+        path_value = image_path
+        if isinstance(image_path, str) and image_path.strip().startswith('{'):
+            try:
+                info = json.loads(image_path)
+                if isinstance(info, dict) and 'image_path' in info:
+                    path_value = info['image_path']
+            except Exception:
+                pass
         if yolo_model is None:
             return "Error: YOLO model not loaded. Object detection unavailable."
             
-        img = cv2.imread(image_path)
+        img = cv2.imread(path_value)
         if img is None:
-            return f"Error: Could not load image at '{image_path}'."
+            return f"Error: Could not load image at '{path_value}'."
 
         results = yolo_model(img)
         detected_objects = []
@@ -162,6 +197,139 @@ def get_object_dimensions(image_path: str) -> str:
 
     except Exception as e:
         return f"Error during object detection: {str(e)}"
+
+@tool
+def get_image_pdf_scale(pdf_path: str, page_number: int, image_path: str) -> str:
+    """
+    Compute scale factors to map image pixel coordinates (from a rendered page image)
+    back to PDF page coordinates (points). Returns JSON with image and page sizes and scales.
+    Accepts either an image path or a JSON string containing `image_path`, `zoom`, and `rotation`.
+    """
+    try:
+        if not os.path.exists(pdf_path):
+            return f"Error: PDF file not found at '{pdf_path}'."
+        # Accept JSON or plain path
+        path_value = image_path
+        zoom = None
+        rotation = 0
+        if isinstance(image_path, str) and image_path.strip().startswith('{'):
+            try:
+                info = json.loads(image_path)
+                if isinstance(info, dict):
+                    path_value = info.get('image_path', path_value)
+                    zoom = info.get('zoom', zoom)
+                    rotation = info.get('rotation', rotation)
+            except Exception:
+                pass
+        if not os.path.exists(path_value):
+            return f"Error: Image file not found at '{path_value}'."
+        with fitz.open(pdf_path) as doc:
+            if not 1 <= page_number <= len(doc):
+                return f"Error: Invalid page number. PDF has {len(doc)} pages."
+            page = doc.load_page(page_number - 1)
+            page_width_pt = float(page.rect.width)
+            page_height_pt = float(page.rect.height)
+        img = cv2.imread(path_value)
+        if img is None:
+            return f"Error: Could not load image at '{path_value}'."
+        image_height, image_width = img.shape[:2]
+        if zoom and rotation == 0:
+            scale_x = 1.0 / float(zoom)
+            scale_y = 1.0 / float(zoom)
+        else:
+            scale_x = page_width_pt / float(image_width)
+            scale_y = page_height_pt / float(image_height)
+        result = {
+            "image_path": path_value,
+            "page_number": page_number,
+            "image_width": image_width,
+            "image_height": image_height,
+            "page_width_pt": page_width_pt,
+            "page_height_pt": page_height_pt,
+            "scale_x": scale_x,
+            "scale_y": scale_y,
+            "zoom": zoom,
+            "rotation": rotation
+        }
+        print(f"DEBUG: Mapping scales computed: scale_x={scale_x}, scale_y={scale_y}")
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error computing image-PDF scale: {str(e)}"
+
+@tool
+def map_image_bbox_to_pdf_rect(pdf_path: str, page_number: int, image_path: str, x1: float, y1: float, x2: float, y2: float) -> str:
+    """
+    Convert an image-space bounding box (pixels) to a PDF-space rectangle (points).
+    Returns JSON {x1,y1,x2,y2} in page coordinates. Accepts image_path as plain path or JSON string
+    returned by convert_pdf_page_to_image.
+    """
+    try:
+        # Accept JSON or plain path
+        path_value = image_path
+        zoom = None
+        rotation = 0
+        if isinstance(image_path, str) and image_path.strip().startswith('{'):
+            try:
+                info = json.loads(image_path)
+                if isinstance(info, dict):
+                    path_value = info.get('image_path', path_value)
+                    zoom = info.get('zoom', zoom)
+                    rotation = info.get('rotation', rotation)
+            except Exception:
+                pass
+        if not os.path.exists(path_value):
+            return f"Error: Image file not found at '{path_value}'."
+        # Load page and image to compute scales
+        with fitz.open(pdf_path) as doc:
+            if not 1 <= page_number <= len(doc):
+                return f"Error: Invalid page number. PDF has {len(doc)} pages."
+            page = doc.load_page(page_number - 1)
+            page_width_pt = float(page.rect.width)
+            page_height_pt = float(page.rect.height)
+        img = cv2.imread(path_value)
+        if img is None:
+            return f"Error: Could not load image at '{path_value}'."
+        image_height, image_width = img.shape[:2]
+        if zoom and rotation == 0:
+            # Exact mapping using zoom (points = pixels / zoom)
+            scale_x = 1.0 / float(zoom)
+            scale_y = 1.0 / float(zoom)
+        else:
+            # Fallback mapping by proportions
+            scale_x = page_width_pt / float(image_width)
+            scale_y = page_height_pt / float(image_height)
+        x1_pt = float(x1) * scale_x
+        y1_pt = float(y1) * scale_y
+        x2_pt = float(x2) * scale_x
+        y2_pt = float(y2) * scale_y
+        coords = {
+            "x1": round(x1_pt, 2),
+            "y1": round(y1_pt, 2),
+            "x2": round(x2_pt, 2),
+            "y2": round(y2_pt, 2)
+        }
+        print(f"DEBUG: Mapped image bbox ({x1},{y1},{x2},{y2}) -> PDF rect {coords}")
+        return json.dumps(coords)
+    except Exception as e:
+        return f"Error mapping bbox: {str(e)}"
+
+@tool
+def add_rectangle_from_image_bbox(pdf_path: str, page_number: int, image_path: str, x1: float, y1: float, x2: float, y2: float, color: str = "red") -> str:
+    """
+    Convenience tool: converts an image-space bbox to page coordinates and returns a rectangle annotation instruction JSON.
+    Accepts image_path as plain path or the JSON returned by convert_pdf_page_to_image.
+    """
+    try:
+        mapped_json = map_image_bbox_to_pdf_rect(pdf_path, page_number, image_path, x1, y1, x2, y2)
+        try:
+            mapped = json.loads(mapped_json)
+            result = create_annotation_instruction('rectangle', page_number, [mapped['x1'], mapped['y1'], mapped['x2'], mapped['y2']], color=color)
+            print(f"DEBUG: Created rectangle-from-image instruction: {result}")
+            return result
+        except Exception as parse_err:
+            return f"Error: Could not convert mapped bbox to rectangle instruction. Details: {parse_err}. Raw: {mapped_json}"
+    except Exception as e:
+        return f"Error creating rectangle from image bbox: {str(e)}"
 
 @tool
 def add_highlight_instruction(page_number: int, x1: float, y1: float, x2: float, y2: float) -> str:
@@ -221,7 +389,7 @@ def apply_annotations_to_pdf(pdf_path: str, annotations_json: List[str], output_
         for i, ann_json in enumerate(annotations_json):
             try:
                 ann_dict = json.loads(ann_json)
-                annotation = Annotation(**ann_dict)
+                annotation = Annotation(**(ann_dict if isinstance(ann_dict, dict) else json.loads(ann_dict))) if isinstance(ann_dict, str) else Annotation(**ann_dict)
                 annotations.append(annotation)
                 print(f"DEBUG: Parsed annotation {i+1}: {annotation}")
             except Exception as e:
@@ -246,25 +414,45 @@ def apply_annotations_to_pdf(pdf_path: str, annotations_json: List[str], output_
                 
                 # Get color - with fallback
                 try:
-                    if ann.color in ['red', 'blue', 'green', 'yellow', 'black', 'white']:
-                        color = fitz.utils.getColor(ann.color)
+                    if ann.color and ann.color.lower() in ['red', 'blue', 'green', 'yellow', 'black', 'white']:
+                        color_map = {
+                            'red': (1, 0, 0),
+                            'blue': (0, 0, 1),
+                            'green': (0, 1, 0),
+                            'yellow': (1, 1, 0),
+                            'black': (0, 0, 0),
+                            'white': (1, 1, 1)
+                        }
+                        color = color_map.get(ann.color.lower(), (1, 0, 0))
                     else:
-                        color = (1, 0, 0)  # Default to red
+                        color = (1, 0, 0)
                 except:
                     color = (1, 0, 0)  # Default to red
                 
                 print(f"DEBUG: Using color: {color}")
                 
+                # Utility: clamp / intersect rect with page bounds
+                def clamp_rect(x1, y1, x2, y2):
+                    rect = fitz.Rect(x1, y1, x2, y2)
+                    intersected = rect & page.rect
+                    return intersected
+                
                 # Apply annotation based on type
                 if ann.type == "highlight":
-                    rect = fitz.Rect(ann.coordinates)
+                    rect = clamp_rect(*ann.coordinates)
+                    if rect.is_empty or rect.width == 0 or rect.height == 0:
+                        print(f"DEBUG: Skipping highlight - rect out of bounds or empty: {ann.coordinates}")
+                        continue
                     print(f"DEBUG: Creating highlight at {rect}")
                     annot = page.add_highlight_annot(rect)
-                    annot.set_colors(stroke=color)
+                    annot.set_colors(stroke=color, fill=color)
                     annot.update()
                 
                 elif ann.type == "rectangle":
-                    rect = fitz.Rect(ann.coordinates)
+                    rect = clamp_rect(*ann.coordinates)
+                    if rect.is_empty or rect.width == 0 or rect.height == 0:
+                        print(f"DEBUG: Skipping rectangle - rect out of bounds or empty: {ann.coordinates}")
+                        continue
                     print(f"DEBUG: Creating rectangle at {rect}")
                     annot = page.add_rect_annot(rect)
                     annot.set_colors(stroke=color)
@@ -272,7 +460,10 @@ def apply_annotations_to_pdf(pdf_path: str, annotations_json: List[str], output_
                     annot.update()
                 
                 elif ann.type == "circle":
-                    rect = fitz.Rect(ann.coordinates)
+                    rect = clamp_rect(*ann.coordinates)
+                    if rect.is_empty or rect.width == 0 or rect.height == 0:
+                        print(f"DEBUG: Skipping circle - rect out of bounds or empty: {ann.coordinates}")
+                        continue
                     print(f"DEBUG: Creating circle at {rect}")
                     annot = page.add_circle_annot(rect)
                     annot.set_colors(stroke=color)
@@ -281,15 +472,16 @@ def apply_annotations_to_pdf(pdf_path: str, annotations_json: List[str], output_
                 
                 elif ann.type == "note":
                     point = fitz.Point(ann.coordinates[0], ann.coordinates[1])
-                    print(f"DEBUG: Adding text '{ann.text}' at {point}")
-                    page.insert_text(point, ann.text or "Note", color=color, fontsize=12)
+                    print(f"DEBUG: Adding text note '{ann.text}' at {point}")
+                    annot = page.add_text_annot(point, ann.text or "Note")
+                    annot.set_colors(stroke=color, fill=color)
+                    annot.update()
                 
                 elif ann.type == "arrow":
                     start_point = fitz.Point(ann.coordinates[0], ann.coordinates[1])
                     end_point = fitz.Point(ann.coordinates[2], ann.coordinates[3])
                     print(f"DEBUG: Creating arrow from {start_point} to {end_point}")
                     annot = page.add_line_annot(start_point, end_point)
-                    # Use integer values for line ends (0=none, 1=square, 2=circle, 3=diamond, 4=open_arrow, 5=closed_arrow)
                     annot.set_line_ends(0, 5)  # No start, closed arrow end
                     annot.set_colors(stroke=color)
                     annot.set_border(width=ann.line_width or 2.0)
@@ -298,7 +490,10 @@ def apply_annotations_to_pdf(pdf_path: str, annotations_json: List[str], output_
                 elif ann.type == "dot":
                     radius = 5
                     center = fitz.Point(ann.coordinates[0], ann.coordinates[1])
-                    rect = fitz.Rect(center.x - radius, center.y - radius, center.x + radius, center.y + radius)
+                    rect = clamp_rect(center.x - radius, center.y - radius, center.x + radius, center.y + radius)
+                    if rect.is_empty or rect.width == 0 or rect.height == 0:
+                        print(f"DEBUG: Skipping dot - rect out of bounds or empty around: {ann.coordinates}")
+                        continue
                     print(f"DEBUG: Creating dot at {center}")
                     annot = page.add_circle_annot(rect)
                     annot.set_colors(stroke=color, fill=color)
@@ -330,7 +525,8 @@ all_tools = [
     load_pdf, get_page_info, add_highlight_instruction, add_circle_instruction,
     add_rectangle_instruction, add_note_instruction, add_arrow_instruction,
     add_count_marker_instruction, apply_annotations_to_pdf, get_object_dimensions,
-    convert_pdf_page_to_image
+    convert_pdf_page_to_image, get_image_pdf_scale, map_image_bbox_to_pdf_rect,
+    add_rectangle_from_image_bbox
 ]
 
 prompt = ChatPromptTemplate.from_messages([
@@ -339,21 +535,26 @@ Your workflow is as follows:
 
 1.  **Load PDF First**: Always start by calling `load_pdf` to verify the PDF exists and get page count.
 
-2.  **Preparation (Image Conversion)**: If the task requires visual analysis (e.g., identifying specific objects like doors, windows, or equipment), convert the relevant PDF page into an image using the `convert_pdf_page_to_image` tool. You will need to specify the `pdf_path` and `page_number`.
+2.  **Preparation (Image Conversion)**: If the task requires visual analysis (e.g., identifying specific objects like doors, windows, or equipment), convert the relevant PDF page into an image using the `convert_pdf_page_to_image` tool. You will need to specify the `pdf_path` and `page_number`. This tool returns JSON including `image_path` and mapping scales.
 
-3.  **Visual Analysis (Object Detection)**: After successfully converting the page to an image, use the `get_object_dimensions` tool with the path to the newly created image. This tool will identify key objects and their bounding box coordinates.
+3.  **Visual Analysis (Object Detection)**: After successfully converting the page to an image, use the `get_object_dimensions` tool with the `image_path`. This tool will identify key objects and their bounding box coordinates in IMAGE PIXELS.
 
-4.  **Textual Analysis (Information Extraction)**: Use the `get_page_info` tool to extract text and its coordinates from the PDF page. This provides textual context and helps in locating specific labels or descriptions.
+4.  **Textual Analysis (Information Extraction)**: Use the `get_page_info` tool to extract text and its coordinates from the PDF page.
 
-5.  **Create Annotation Instructions**: Based on the user's request, call the appropriate annotation instruction tool for each item you want to mark. COLLECT ALL THE JSON RESPONSES from these tools - you will need to pass them to the final step.
+5.  **Coordinate Mapping (CRITICAL)**: Before creating annotation instructions from any image-derived bounding boxes, CONVERT coordinates to PDF space using one of:
+    - `map_image_bbox_to_pdf_rect(pdf_path, page_number, image_path, x1, y1, x2, y2)` to get PDF coords
+    - `add_rectangle_from_image_bbox(...)` to directly create a rectangle annotation instruction
+    You may also call `get_image_pdf_scale` to obtain mapping scales.
+
+6.  **Create Annotation Instructions**: Based on the user's request, call the appropriate annotation instruction tool for each item you want to mark. Always ensure coordinates are in PDF space (points):
     - To **highlight**: Use `add_highlight_instruction`.
     - To **encircle**: Use `add_circle_instruction`.
-    - To **outline**: Use `add_rectangle_instruction`.
+    - To **outline**: Use `add_rectangle_instruction` or `add_rectangle_from_image_bbox` when deriving from image boxes.
     - For **callouts/arrows**: Use `add_arrow_instruction`.
     - To **add text labels**: Use `add_note_instruction`.
     - To **count items**: Use `add_count_marker_instruction` to place a dot on each item.
 
-6.  **Final Application**: After you have created ALL necessary annotation instructions, make *one final call* to the `apply_annotations_to_pdf` tool. Pass the complete list of JSON strings you received from step 5 to this tool.
+7.  **Final Application**: After you have created ALL necessary annotation instructions, make one final call to `apply_annotations_to_pdf` with the complete list of JSON strings you collected.
 
 IMPORTANT: Your final action MUST be to call `apply_annotations_to_pdf` with ALL the JSON annotation instructions you collected. Do not skip this step!
 """),
@@ -371,7 +572,7 @@ def should_continue(state: GraphState) -> str:
 
 def call_agent(state: GraphState):
     response = agent_executor.invoke(state)
-    return {"messages": [AIMessage(content=response["output"])]}
+    return {"messages": [AIMessage(content=response["output"]) ]}
 
 workflow = StateGraph(GraphState)
 workflow.add_node("agent", call_agent)
@@ -417,10 +618,15 @@ def process_pdf_with_annotations(pdf_path: str, user_request: str, output_path: 
         file_size = os.path.getsize(output_path)
         print(f"✅ Annotated PDF is available at: {output_path} (Size: {file_size} bytes)")
         
-        # Quick verification - try to open and count annotations
+        # Robust verification - count annotations reliably
         try:
             with fitz.open(output_path) as doc:
-                total_annots = sum(len(page.annots()) for page in doc)
+                total_annots = 0
+                for page in doc:
+                    annot = page.first_annot
+                    while annot:
+                        total_annots += 1
+                        annot = annot.next
                 print(f"✅ PDF contains {total_annots} annotations")
         except Exception as e:
             print(f"⚠️ Could not verify annotations: {e}")
