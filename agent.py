@@ -218,14 +218,47 @@ def apply_annotations_to_pdf(pdf_path: str, annotations_json: List[str], output_
         
         # Parse annotations
         annotations = []
-        for i, ann_json in enumerate(annotations_json):
+        # Normalize input to a list of dicts
+        normalized_items = []
+        try:
+            if isinstance(annotations_json, str):
+                try:
+                    parsed = json.loads(annotations_json)
+                    if isinstance(parsed, list):
+                        normalized_items = parsed
+                    elif isinstance(parsed, dict):
+                        normalized_items = [parsed]
+                    else:
+                        print("DEBUG: annotations_json string parsed to unexpected type; attempting line-split parse")
+                except Exception:
+                    # Try to parse as newline-delimited JSON objects
+                    parts = [p.strip().rstrip(',') for p in annotations_json.splitlines() if p.strip()]
+                    for p in parts:
+                        try:
+                            normalized_items.append(json.loads(p))
+                        except Exception as e:
+                            print(f"DEBUG: Skipping non-JSON line during parse: {p[:80]}... Error: {e}")
+            elif isinstance(annotations_json, list):
+                normalized_items = annotations_json
+            else:
+                print(f"DEBUG: annotations_json had unexpected type: {type(annotations_json)}")
+        except Exception as e:
+            print(f"DEBUG: Error normalizing annotations_json: {e}")
+
+        for i, item in enumerate(normalized_items):
             try:
-                ann_dict = json.loads(ann_json)
+                if isinstance(item, str):
+                    ann_dict = json.loads(item)
+                elif isinstance(item, dict):
+                    ann_dict = item
+                else:
+                    print(f"DEBUG: Skipping item {i+1} due to unexpected type: {type(item)}")
+                    continue
                 annotation = Annotation(**ann_dict)
                 annotations.append(annotation)
                 print(f"DEBUG: Parsed annotation {i+1}: {annotation}")
             except Exception as e:
-                print(f"DEBUG: Failed to parse annotation {i+1}: {ann_json}, Error: {e}")
+                print(f"DEBUG: Failed to parse annotation {i+1}: {item}, Error: {e}")
                 continue
         
         if not annotations:
@@ -259,8 +292,25 @@ def apply_annotations_to_pdf(pdf_path: str, annotations_json: List[str], output_
                 if ann.type == "highlight":
                     rect = fitz.Rect(ann.coordinates)
                     print(f"DEBUG: Creating highlight at {rect}")
-                    annot = page.add_highlight_annot(rect)
-                    annot.set_colors(stroke=color)
+                    # Try to highlight actual text within the rectangle; fallback to a semi-transparent filled rectangle
+                    try:
+                        words = page.get_text("words") or []
+                        quads = [fitz.Quad(fitz.Rect(w[:4])) for w in words if fitz.Rect(w[:4]).intersects(rect)]
+                    except Exception:
+                        quads = []
+                    if quads:
+                        annot = page.add_highlight_annot(quads)
+                        annot.set_colors(stroke=color, fill=color)
+                        annot.set_opacity(0.35)
+                    else:
+                        annot = page.add_rect_annot(rect)
+                        annot.set_colors(stroke=color, fill=color)
+                        annot.set_border(width=ann.line_width or 1.5)
+                        annot.set_opacity(0.25)
+                    try:
+                        annot.set_flags(getattr(fitz, "ANNOT_FLAG_PRINT", 4))
+                    except Exception:
+                        pass
                     annot.update()
                 
                 elif ann.type == "rectangle":
@@ -269,6 +319,10 @@ def apply_annotations_to_pdf(pdf_path: str, annotations_json: List[str], output_
                     annot = page.add_rect_annot(rect)
                     annot.set_colors(stroke=color)
                     annot.set_border(width=ann.line_width or 1.5)
+                    try:
+                        annot.set_flags(getattr(fitz, "ANNOT_FLAG_PRINT", 4))
+                    except Exception:
+                        pass
                     annot.update()
                 
                 elif ann.type == "circle":
@@ -277,22 +331,39 @@ def apply_annotations_to_pdf(pdf_path: str, annotations_json: List[str], output_
                     annot = page.add_circle_annot(rect)
                     annot.set_colors(stroke=color)
                     annot.set_border(width=ann.line_width or 1.5)
+                    try:
+                        annot.set_flags(getattr(fitz, "ANNOT_FLAG_PRINT", 4))
+                    except Exception:
+                        pass
                     annot.update()
                 
                 elif ann.type == "note":
                     point = fitz.Point(ann.coordinates[0], ann.coordinates[1])
-                    print(f"DEBUG: Adding text '{ann.text}' at {point}")
-                    page.insert_text(point, ann.text or "Note", color=color, fontsize=12)
+                    text_str = ann.text or "Note"
+                    # Use a FreeText annotation so it reliably appears in viewers and print/export
+                    rect = fitz.Rect(point.x, point.y, point.x + 180, point.y + 40)
+                    print(f"DEBUG: Adding free text '{text_str}' at {rect}")
+                    annot = page.add_freetext_annot(rect, text_str)
+                    annot.set_colors(stroke=color, fill=(1, 1, 1))
+                    annot.set_border(width=ann.line_width or 1.0)
+                    try:
+                        annot.set_flags(getattr(fitz, "ANNOT_FLAG_PRINT", 4))
+                    except Exception:
+                        pass
+                    annot.update()
                 
                 elif ann.type == "arrow":
                     start_point = fitz.Point(ann.coordinates[0], ann.coordinates[1])
                     end_point = fitz.Point(ann.coordinates[2], ann.coordinates[3])
                     print(f"DEBUG: Creating arrow from {start_point} to {end_point}")
                     annot = page.add_line_annot(start_point, end_point)
-                    # Use integer values for line ends (0=none, 1=square, 2=circle, 3=diamond, 4=open_arrow, 5=closed_arrow)
                     annot.set_line_ends(0, 5)  # No start, closed arrow end
                     annot.set_colors(stroke=color)
                     annot.set_border(width=ann.line_width or 2.0)
+                    try:
+                        annot.set_flags(getattr(fitz, "ANNOT_FLAG_PRINT", 4))
+                    except Exception:
+                        pass
                     annot.update()
                 
                 elif ann.type == "dot":
@@ -302,14 +373,36 @@ def apply_annotations_to_pdf(pdf_path: str, annotations_json: List[str], output_
                     print(f"DEBUG: Creating dot at {center}")
                     annot = page.add_circle_annot(rect)
                     annot.set_colors(stroke=color, fill=color)
+                    try:
+                        annot.set_flags(getattr(fitz, "ANNOT_FLAG_PRINT", 4))
+                    except Exception:
+                        pass
                     annot.update()
                 
                 else:
                     print(f"DEBUG: Unknown annotation type: {ann.type}")
 
             # Save the PDF
+            # Finalize: ensure annotations will appear in all viewers/printed exports by flattening them
+            try:
+                for page_index in range(len(pdf_document)):
+                    page_obj = pdf_document.load_page(page_index)
+                    annot = page_obj.first_annot
+                    while annot is not None:
+                        try:
+                            # ensure print flag, then flatten
+                            annot.set_flags(getattr(fitz, "ANNOT_FLAG_PRINT", 4))
+                            annot.update()
+                            next_annot = annot.next
+                            annot.flatten()
+                            annot = next_annot
+                        except Exception:
+                            annot = getattr(annot, 'next', None)
+            except Exception as e:
+                print(f"DEBUG: Failed to flatten annotations: {e}")
+
             print(f"DEBUG: Saving PDF to {output_path}")
-            pdf_document.save(output_path, garbage=4, deflate=True)
+            pdf_document.save(output_path, garbage=4, deflate=True, clean=True, incremental=False)
             
         # Verify the file was created
         if os.path.exists(output_path):
@@ -420,12 +513,22 @@ def process_pdf_with_annotations(pdf_path: str, user_request: str, output_path: 
         # Quick verification - try to open and count annotations
         try:
             with fitz.open(output_path) as doc:
-                total_annots = sum(len(page.annots()) for page in doc)
+                total_annots = 0
+                for page in doc:
+                    try:
+                        for _ in (page.annots() or []):
+                            total_annots += 1
+                    except Exception:
+                        annot = page.first_annot
+                        while annot is not None:
+                            total_annots += 1
+                            annot = annot.next
                 print(f"✅ PDF contains {total_annots} annotations")
         except Exception as e:
             print(f"⚠️ Could not verify annotations: {e}")
     else:
         print(f"❌ Output file not found at: {output_path}")
+    return output_path if os.path.exists(output_path) else None
 
 # --- Example Usage ---
 if __name__ == "__main__":
